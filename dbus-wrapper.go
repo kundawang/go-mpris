@@ -20,6 +20,10 @@ func (w dbusConnWrapper) Signal(ch chan<- *dbus.Signal) {
 	w.conn.Signal(ch)
 }
 
+func (w dbusConnWrapper) RemoveSignal(ch chan<- *dbus.Signal) {
+	w.conn.RemoveSignal(ch)
+}
+
 type dbusBusObjectWrapper struct {
 	obj dbus.BusObject
 }

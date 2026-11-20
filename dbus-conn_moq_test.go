@@ -46,6 +46,9 @@ type dbusConnMock struct {
 	// ObjectFunc mocks the Object method.
 	ObjectFunc func(s string, objectPath dbus.ObjectPath) dbusBusObject
 
+	// RemoveSignalFunc mocks the RemoveSignal method.
+	RemoveSignalFunc func(ch chan<- *dbus.Signal)
+
 	// SignalFunc mocks the Signal method.
 	SignalFunc func(ch chan<- *dbus.Signal)
 
@@ -66,6 +69,11 @@ type dbusConnMock struct {
 			// ObjectPath is the objectPath argument value.
 			ObjectPath dbus.ObjectPath
 		}
+		// RemoveSignal holds details about calls to the RemoveSignal method.
+		RemoveSignal []struct {
+			// Ch is the ch argument value.
+			Ch chan<- *dbus.Signal
+		}
 		// Signal holds details about calls to the Signal method.
 		Signal []struct {
 			// Ch is the ch argument value.
@@ -75,6 +83,7 @@ type dbusConnMock struct {
 	lockAddMatchSignal sync.RWMutex
 	lockClose          sync.RWMutex
 	lockObject         sync.RWMutex
+	lockRemoveSignal   sync.RWMutex
 	lockSignal         sync.RWMutex
 }
 
@@ -170,6 +179,38 @@ func (mock *dbusConnMock) ObjectCalls() []struct {
 	mock.lockObject.RLock()
 	calls = mock.calls.Object
 	mock.lockObject.RUnlock()
+	return calls
+}
+
+// RemoveSignal calls RemoveSignalFunc.
+func (mock *dbusConnMock) RemoveSignal(ch chan<- *dbus.Signal) {
+	if mock.RemoveSignalFunc == nil {
+		panic("dbusConnMock.RemoveSignalFunc: method is nil but dbusConn.RemoveSignal was just called")
+	}
+	callInfo := struct {
+		Ch chan<- *dbus.Signal
+	}{
+		Ch: ch,
+	}
+	mock.lockRemoveSignal.Lock()
+	mock.calls.RemoveSignal = append(mock.calls.RemoveSignal, callInfo)
+	mock.lockRemoveSignal.Unlock()
+	mock.RemoveSignalFunc(ch)
+}
+
+// RemoveSignalCalls gets all the calls that were made to RemoveSignal.
+// Check the length with:
+//
+//	len(mockeddbusConn.RemoveSignalCalls())
+func (mock *dbusConnMock) RemoveSignalCalls() []struct {
+	Ch chan<- *dbus.Signal
+} {
+	var calls []struct {
+		Ch chan<- *dbus.Signal
+	}
+	mock.lockRemoveSignal.RLock()
+	calls = mock.calls.RemoveSignal
+	mock.lockRemoveSignal.RUnlock()
 	return calls
 }
 

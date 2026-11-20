@@ -3,6 +3,7 @@ package mpris
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/godbus/dbus/v5"
 )
@@ -43,6 +44,7 @@ var dbusSessionBus = dbus.SessionBus
 type dbusConn interface {
 	Object(string, dbus.ObjectPath) dbusBusObject
 	AddMatchSignal(...dbus.MatchOption) error
+	RemoveSignal(chan<- *dbus.Signal)
 	Signal(ch chan<- *dbus.Signal)
 	Close() error
 }
@@ -65,6 +67,12 @@ type dbusCall interface {
 type Player struct {
 	name       string
 	connection dbusConn
+
+	// hubMu is a pointer so that Player keeps its existing value semantics and can
+	// still be copied without copying a lock. It is initialized lazily on the first
+	// Subscribe/Close call; zero-value Players created in tests never touch it.
+	hubMu *sync.Mutex
+	hub   *stateHub
 }
 
 // NewPlayer returns a new Player which is already connected to session-bus via dbus.SessionBus.
@@ -97,13 +105,121 @@ func NewPlayerWithConnection(name string, connection *dbus.Conn) Player {
 }
 
 // Close closes the dbus connection.
+// Active subscriptions receive an Event carrying ErrSubscriptionClosed and are
+// closed before the connection is shut down.
 func (p Player) Close() error {
+	p.stopHub()
+
 	err := p.connection.Close()
 	if err != nil {
 		return fmt.Errorf("failed to close dbus connection: %w", err)
 	}
 
 	return nil
+}
+
+// Subscribe starts a cancellable, ordered stream of aggregated player state events.
+//
+// The returned subscription combines PlaybackStatus, Metadata and Position property
+// changes with Seeked signals and player name ownership changes into one consistent
+// snapshot per event. Events are delivered in the order in which the underlying
+// D-Bus signals were received, so fast track switches can never be missed or observed
+// out of order. The first event is always of kind EventInitial and carries a freshly
+// fetched snapshot.
+//
+// All subscriptions on one Player share a single D-Bus signal registration and a
+// single hub goroutine; each subscriber has its own buffered channel, so a slow
+// subscriber never consumes or blocks another subscriber's events. The
+// DisconnectPolicy and reconnect interval are hub-wide: the first subscription on a
+// Player fixes them for the lifetime of the hub; per-subscriber buffering and the
+// slow-consumer policy remain independent.
+//
+// Canceling ctx or calling Subscription.Unsubscribe closes the event channel and
+// releases the subscription. When the last subscription ends, the hub goroutine and
+// signal registration stay alive until Player.Close is called, so re-subscribing is
+// cheap; Player.Close terminates everything deterministically.
+//
+// An error is only returned synchronously when the subscription cannot be
+// established (e.g. the player is not reachable or a match rule cannot be
+// registered). Runtime failures are delivered as terminal events.
+func (p *Player) Subscribe(ctx context.Context, options ...SubscribeOption) (*Subscription, error) {
+	cfg := defaultSubscribeConfig()
+	for _, option := range options {
+		option(&cfg)
+	}
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		hub, err := p.ensureHub()
+		if err != nil {
+			return nil, err
+		}
+
+		subscription, err := hub.subscribe(ctx, cfg)
+		if err == nil {
+			return subscription, nil
+		}
+		if err != errHubStopped {
+			return nil, err
+		}
+		// The hub terminated concurrently (e.g. player vanished with
+		// DisconnectTerminate). Drop it and retry with a fresh hub.
+		p.resetHubIf(hub)
+	}
+}
+
+func (p *Player) ensureHub() (*stateHub, error) {
+	p.initHubLock()
+	p.hubMu.Lock()
+	defer p.hubMu.Unlock()
+
+	if p.hub != nil {
+		select {
+		case <-p.hub.done:
+			p.hub = nil
+		default:
+			return p.hub, nil
+		}
+	}
+
+	hub := newStateHub(p)
+	if err := hub.start(); err != nil {
+		return nil, fmt.Errorf("failed to start state subscription: %w", err)
+	}
+	p.hub = hub
+	return hub, nil
+}
+
+func (p *Player) resetHubIf(old *stateHub) {
+	p.initHubLock()
+	p.hubMu.Lock()
+	defer p.hubMu.Unlock()
+	if p.hub == old {
+		p.hub = nil
+	}
+}
+
+func (p *Player) initHubLock() {
+	if p.hubMu == nil {
+		p.hubMu = &sync.Mutex{}
+	}
+}
+
+func (p *Player) stopHub() {
+	if p.hubMu == nil {
+		return
+	}
+	p.hubMu.Lock()
+	hub := p.hub
+	p.hub = nil
+	p.hubMu.Unlock()
+
+	if hub != nil {
+		hub.shutdown()
+	}
 }
 
 // Next skips to the next track in the tracklist.

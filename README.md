@@ -88,6 +88,55 @@ https://specifications.freedesktop.org/mpris-spec/2.2/Player_Interface.html
 |--------|-------------------------------------------------------------------|--------------------|
 | Seeked | `mpris.Player.Seeked(<ctx> context.Context) (<-chan int, error) ` | :heavy_check_mark: |
 
+#### State subscription
+
+Polling several MPRIS properties misses fast track changes. `Player.Subscribe` aggregates
+`PlaybackStatus`, `Metadata` and `Position` property changes together with `Seeked` signals
+and player name-ownership changes into one ordered, cancellable event stream. Every event
+carries a consistent `PlayerState` snapshot built by applying the D-Bus signals in receive
+order; a track switch resets `Position` to zero.
+
+```go
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+
+player, err := mpris.NewPlayer("org.mpris.MediaPlayer2.vlc")
+if err != nil { /* handle */ }
+defer player.Close()
+
+sub, err := player.Subscribe(ctx,
+    mpris.WithEventBufferSize(64),
+    mpris.WithDisconnectPolicy(mpris.DisconnectReconnect), // or DisconnectTerminate
+    mpris.WithSlowConsumerPolicy(mpris.SlowConsumerDropOldest),
+)
+if err != nil { /* player not reachable */ }
+
+for event := range sub.Events {
+    if event.Err != nil {
+        // terminal error: ErrPlayerDisconnected, ErrConnectionClosed,
+        // ErrSlowConsumer or ErrSubscriptionClosed; the channel is closed afterwards
+        log.Fatal(event.Err)
+    }
+
+    title, _ := event.State.Metadata.XESAMTitle()
+    fmt.Printf("%s: %s @ %dµs\n", event.Kind, title, event.State.Position)
+}
+```
+
+Guarantees:
+
+- Multiple subscribers on one `Player` share a single D-Bus match registration and hub
+  goroutine; each has an independent buffered channel, so subscribers never consume or
+  block each other.
+- Slow subscribers never stall the hub: the oldest event is dropped (default) or the
+  subscription terminates with `ErrSlowConsumer`.
+- A disappearing player emits `EventDisconnected`; with `DisconnectReconnect` the hub waits
+  for the name to reappear (ownership signal plus polling fallback) and emits
+  `EventReconnected` with a fresh snapshot. Loss of the D-Bus connection itself terminates
+  every subscription with `ErrConnectionClosed`.
+- Canceling the context, calling `Subscription.Unsubscribe` or `Player.Close` releases all
+  goroutines and signal registrations without leaks.
+
 ### TrackList
 
 https://specifications.freedesktop.org/mpris-spec/2.2/Track_List_Interface.html
